@@ -2,15 +2,29 @@
 # Control services for system based on Systemd inside chroot and SysVinit outside chroot
 # https://github.com/smaknsk/servicectl
 #
+# V1.1   31.10.2019   rbrestan
+#   - correct parsing of options which contain =
+#   - process also Environment variables in service script
+#   - run command in background if start and type notify
+#   - add MAINPID processing
+#   - export environment variables
+#   - find only one unit file
+#
 
-# Pach systemd services file
-SYSTEMD_UNITS_PATH="/usr/lib/systemd/system/"
+# Path systemd services file
+unit_file=`find /etc/systemd/system/ -name ${@:2}.service -print -quit`
+if [ -n "$unit_file" ]; then
+  SYSTEMD_UNITS_PATH=`dirname $unit_file`
+  SYSTEMD_UNITS_PATH="${SYSTEMD_UNITS_PATH}/"
+else
+  SYSTEMD_UNITS_PATH="/usr/lib/systemd/system/"
+fi
 
 # Path locate this script
 DIR=$(dirname $(readlink -f $0))
 
 # Path contents symlink on systemd units files
-SERVICECTL_ENABLED_PATH="$DIR/enabled/"
+SERVICECTL_ENABLED_PATH="/etc/systemd/system/multi-user.target.wants/"
 
 # Check is root
 if [ $EUID -ne 0 ]; then
@@ -29,14 +43,15 @@ function parse()
    if [ ! -r "$_inifile" ]
    then
      exit 1;
-   fi        
+   fi
 
    exec < $_inifile
 
    while read section; do
      if [ "$section" = '['$_section']' ] ; then
-       IFS='='
-       while read key value; do
+       while read oneline; do
+         key=`echo $oneline | awk -F= '{print $1}'`
+         value=`echo $oneline | cut -d= -f2-`
          # check if we are still within our section
          if [ `echo -n $key | grep "^\s*\[.*\]\s*$"` ]; then
             exit 2;
@@ -61,29 +76,71 @@ function exec_action() {
     local file="${SYSTEMD_UNITS_PATH}${service}.service"
     local is_required=1 # by default turn action is required
     local cmd=""
-        
+
     # if passed arg $3 then set value
     if [[ -n $3 ]]; then
         local is_required=$3
     fi
 
+    set -a
+    touch /tmp/servicectl.$$
+    cat $file | grep -e '^Environment=' | cut -d= -f2-> /tmp/servicectl.$$
+    . /tmp/servicectl.$$
+    rm -f /tmp/servicectl.$$
+
+    env_files=$(cat $file | grep -e '^EnvironmentFile' | awk -F= '{print $2}' | sed -r "s/^-(.*)/\1/")
+    for env_file in ${env_files[*]}
+    do
+      if [ -f "$env_file" ]; then
+        . $env_file
+      fi
+    done
+
     cmd=`parse $file Service $action`
-    local ret=$?    
+    local ret=$?
     if [ $ret = 1 ]; then
         echo "Error: file $file cannot be opened"
         return 1
     fi
     if [ $ret = 2 ]; then
-    
+
         # if action required, return error
         if [ $is_required = 1 ]; then
             echo "Error: action $action not found in file $file"
             return 1
         fi
-        
-        return 0        
+
+        return 0
     fi
-  
+
+    local type=""
+    type=`parse $file Service Type`
+    local ret=$?
+    if [ $ret = 0 ]; then
+        # Type in service file found
+        if [ "$type" = "notify" ]; then
+            # service must run in background
+            if [ "$action" = "ExecStart" ]; then
+                # run start in background
+                cmd=$cmd" &"
+            fi
+        fi
+    fi
+
+    # get path pid file
+    pid_file=`parse $file Service PIDFile`
+    local ret=$?
+    if [ $ret = 0 ]; then
+        # pid file path exists, check for existance
+        if [ -f $pid_file ]; then
+            read MAINPID < $pid_file
+        else
+            MAINPID=`pgrep -o $service`
+        fi
+    else
+        MAINPID=`pgrep -o $service`
+    fi
+
     eval $cmd
     return $?
 }
@@ -96,26 +153,37 @@ function exec_stop() {
     local service=$1
     local file="${SYSTEMD_UNITS_PATH}${service}.service"
     local cmd=""
-    
+
+    env_files=$(cat $file | grep EnvironmentFile | awk -F= '{print $2}' | sed -r "s/^-(.*)/\1/")
+    for env_file in ${env_files[*]}
+    do
+      if [ -f "$env_file" ]; then
+        . $env_file
+      fi
+    done
+
     cmd=`parse $file Service ExecStop`
     local ret=$?
-    
+
     # if ExecStop exists
     if [ $ret = 0 ]; then
         exec_action ExecStop $service
         return $?
     fi
-    
+
     # get path pid file
     pid_file=`parse $file Service PIDFile`
     local ret=$?
-    if [ $ret != 0 ]; then
-        echo "Error: attribute PIDFile not exists in file $file"
-        return 1
+    if [ $ret = 0 ]; then
+        # pid file path exists, check for existance
+        if [ -f $pid_file ]; then
+            read PID < $pid_file
+            kill -TERM "$PID" || echo "Couldn't kill PID"
+            return
+        fi
     fi
 
-    read PID < $pid_file
-    kill -TERM "$PID" || echo "Couldn't kill PID"
+    killall $service || echo "Coundn't kill $service"
 }
 
 if [[ -z ${@:2} ]]; then
@@ -126,7 +194,7 @@ fi
 # Switch action
 case "$1" in
     start)
-        for service in ${@:2} 
+        for service in ${@:2}
         do
             service=${service%".service"}
             exec_if_exists ExecStartPre $service
@@ -135,26 +203,26 @@ case "$1" in
             fi
         done
     ;;
-    
+
     stop)
-        for service in ${@:2} 
+        for service in ${@:2}
         do
             service=${service%".service"}
             exec_stop $service
         done
     ;;
-    
+
     restart)
-        for service in ${@:2} 
+        for service in ${@:2}
         do
             service=${service%".service"}
             exec_stop $service
             exec_action ExecStart $service
         done
     ;;
-    
+
     reload)
-        for service in ${@:2} 
+        for service in ${@:2}
         do
             service=${service%".service"}
             exec_action ExecReload $service
@@ -162,7 +230,7 @@ case "$1" in
     ;;
 
     enable)
-        for service in ${@:2} 
+        for service in ${@:2}
         do
             service=${service%".service"}
             file="${SYSTEMD_UNITS_PATH}${service}.service"
@@ -184,7 +252,7 @@ case "$1" in
     ;;
 
     disable)
-        for service in ${@:2} 
+        for service in ${@:2}
         do
             service=${service%".service"}
             file="${SERVICECTL_ENABLED_PATH}${service}.service"
@@ -192,14 +260,15 @@ case "$1" in
                 echo "Error: file $file is not exists"
                 continue
             fi
-            
+
             echo "rm $file"
             rm $file
         done
     ;;
-    
+
     *)
         echo "Availble action: start, stop, restart, reload, enable or disable"
         exit 1
     ;;
 esac
+
