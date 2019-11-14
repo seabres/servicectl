@@ -11,6 +11,7 @@ Group:		System Environment/Base
 BuildRoot:	%{_topdir}/BUILDROOT
 BuildArch:	noarch
 Vendor:		Alexander Sobolevskiy
+URL:		https://github.com/seabres/servicectl
 Packager:	rainer.brestan@gmx.net
 Requires:	bash,coreutils,filesystem,setup,systemd,psmisc
 
